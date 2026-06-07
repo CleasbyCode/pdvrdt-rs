@@ -1,18 +1,18 @@
-# pdvrdt_rust
+# pdvrdt-rs
 ***This is an experimental Rust port of my C++ steganography tool [***pdvrdt***](https://github.com/CleasbyCode/pdvrdt)***
 
-***pdvrdt*** is a fast, easy-to-use steganography command-line tool for concealing and extracting any file type via a **PNG** cover image.  
+***pdvrdt-rs*** is a fast, easy-to-use steganography command-line tool for concealing and extracting any file type via a **PNG** cover image.  
 
 There is also a [***Web edition***](https://cleasbycode.co.uk/pdvrdt/app/), which you can use immediately, as a convenient alternative to downloading and compiling the CLI source code. Web file uploads are limited to **20MB**.    
 
 ![Demo Image](https://github.com/CleasbyCode/pdvrdt_rust/blob/main/demo_image/prdt_395918.png)  
 *Image: "Wolf" / ***PIN: 7699785107511381336****
 
-Unlike the common steganography method of concealing data within the pixels of a cover image ([***LSB***](https://ctf101.org/forensics/what-is-stegonagraphy/)), ***pdvrdt*** hides files within various ***chunks*** of a ***PNG*** image, such as iCCP and IDAT. 
+Unlike the common steganography method of concealing data within the pixels of a cover image ([***LSB***](https://ctf101.org/forensics/what-is-stegonagraphy/)), ***pdvrdt-rs*** hides files within various ***chunks*** of a ***PNG*** image, such as ***iCCP*** and ***IDAT***. 
 
 You can conceal any file type up to ***2GB***, although compatible hosting sites (*listed below*) have their own ***much smaller*** size limits and *other requirements.  
 
-For increased storage capacity and better security, your embedded data file is compressed with ***zlib*** and encrypted using the ***libsodium*** cryptographic library.  
+For increased storage capacity and better security, your embedded data file is compressed with ***flate2/zlib*** — unless it's already a compressed file type over 10 MB — and encrypted with ***XChaCha20-Poly1305*** using the ***libsodium*** cryptographic library (via the Rust ***alkali*** bindings).
 
 ## Usage (Linux)
 
@@ -41,7 +41,7 @@ Platform compatibility for output image:-
   ✓ ImgBB
   ✓ Flickr
   
-Saved "file-embedded" PNG image: prdt_12462.png (143029 bytes).
+Saved "file-embedded" PNG image: prdt_151529.png (143029 bytes).
 
 Recovery PIN: [***2166776980318349924***]
 
@@ -49,7 +49,7 @@ Important: Keep your PIN safe, so that you can extract the hidden file.
 
 Complete!
         
-$ pdvrdt-rs recover prdt_12462.png
+$ pdvrdt-rs recover prdt_151529.png
 
 PIN: *******************
 
@@ -72,12 +72,12 @@ https://github.com/user-attachments/assets/76732196-815b-45ac-b71d-6e1aca672e25
 
 https://github.com/user-attachments/assets/7b448218-fe6a-4c3a-8a02-c126dd4cd830
 
-pdvrdt ***mode*** arguments:
+pdvrdt-rs ***mode*** arguments:
  
   ***conceal*** - Compresses, encrypts and embeds your secret data file within a ***PNG*** cover image.  
   ***recover*** - Decrypts, uncompresses and extracts the concealed data file from a ***PNG*** cover image.
  
-pdvrdt ***conceal*** mode platform options:
+pdvrdt-rs ***conceal*** mode platform options:
  
   "***-m***" - To create compatible "*file-embedded*" ***PNG*** images for posting on the ***Mastodon*** platform, you must use the ***-m*** option with ***conceal*** mode.
   ```console

@@ -2,7 +2,15 @@
 name = "pdvrdt"
 version = "4.8.0"
 edition = "2021"
+description = "Linux-only PNG data-vehicle steganography tool (pdvrdt-rs)"
+license = "MIT"
+readme = "README.md"
 autobins = false
+publish = false
+
+[lib]
+name = "pdvrdt"
+path = "src/lib.rs"
 
 [[bin]]
 name = "pdvrdt-rs"

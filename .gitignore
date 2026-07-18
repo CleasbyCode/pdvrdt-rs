@@ -1,1 +1,7 @@
-/target
+/target/
+**/*.rs.bk
+*.swp
+*~
+.DS_Store
+# Local conceal/recover artifacts if left in the tree
+/prdt_*.png

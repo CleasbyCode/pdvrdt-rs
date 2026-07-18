@@ -14,15 +14,12 @@ You can conceal any file type up to ***2GB***, although compatible hosting sites
 
 For increased storage capacity and better security, your embedded data file is compressed with ***flate2/zlib*** — unless it's already a compressed file type over 10 MB — and encrypted with ***XChaCha20-Poly1305*** using the ***libsodium*** cryptographic library (via the Rust ***alkali*** bindings).
 
-## Usage (Linux)
+## Compilation & Usage (Linux)
 
 ```console
-
 $ sudo apt install libsodium-dev pkg-config
 $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 $ cargo build --release
-
-Build complete. Binary at 'target/release/pdvrdt-rs'.
 
 $ sudo cp target/release/pdvrdt-rs /usr/bin
 $ pdvrdt-rs

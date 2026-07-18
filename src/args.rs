@@ -14,7 +14,7 @@ pub fn display_info() {
     print!(
         r#"
 
-PNG Data Vehicle (pdvrdt-rs v4.8)
+PNG Data Vehicle (pdvrdt-rs v4.9)
 Created by Nicholas Cleasby (@CleasbyCode) 24/01/2023.
 
 pdvrdt-rs is a metadata "steganography-like" command-line tool used for concealing and extracting

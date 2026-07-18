@@ -1,4 +1,4 @@
-// PNG Data Vehicle (pdvrdt v4.8). Created by Nicholas Cleasby (@CleasbyCode) 24/01/2023
+// PNG Data Vehicle (pdvrdt v4.9). Created by Nicholas Cleasby (@CleasbyCode) 24/01/2023
 // Linux-only CLI binary for the pdvrdt library.
 
 #[cfg(not(target_os = "linux"))]

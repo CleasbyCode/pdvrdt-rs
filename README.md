@@ -17,9 +17,13 @@ For increased storage capacity and better security, your embedded data file is c
 ## Compilation & Usage (Linux)
 
 ```console
-$ sudo apt install libsodium-dev pkg-config
+$ sudo apt-get update
+$ sudo apt install build-essential curl
+
 $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-$ cargo build --release
+$ source "$HOME/.cargo/env"
+
+$ cargo build --release --locked
 
 $ sudo cp target/release/pdvrdt-rs /usr/bin
 $ pdvrdt-rs
@@ -88,15 +92,47 @@ pdvrdt-rs ***conceal*** mode platform options:
     
  To correctly download images from ***X-Twitter*** or ***Reddit***, click the image in the post to fully expand it, before saving.
 
-## Third-Party Libraries
+## Third-Party Software and Assets
 
-This project makes use of the following third-party libraries:
-- [**libsodium**](https://libsodium.org/) for cryptographic functions.
-  - [**LICENSE**](https://github.com/jedisct1/libsodium/blob/master/LICENSE)
-  - Copyright (c) 2013-2025 Frank Denis (github@pureftpd.org)
-- **zlib**: General-purpose compression library
-  - License: zlib/libpng license (see [***LICENSE***](https://github.com/madler/zlib/blob/develop/LICENSE) file)
-  - Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler
+  This project uses or incorporates:
+
+  - [alkali](https://github.com/tom25519/alkali) — safe Rust bindings for libsodium.
+    - License: MIT OR Apache-2.0
+
+  - [libsodium-sys-stable](https://github.com/jedisct1/libsodium-sys-stable) — libsodium FFI and
+  build integration.
+    - License: MIT OR Apache-2.0
+
+  - [libsodium](https://github.com/jedisct1/libsodium) — cryptographic random generation, Argon2id
+  key derivation, and XChaCha20-Poly1305 secret streams.
+    - Bundled version: 1.0.22, compiled and statically linked by `libsodium-sys-stable`
+    - License: [ISC License](https://github.com/jedisct1/libsodium/blob/master/LICENSE)
+    - Copyright (c) 2013-2026 Frank Denis
+
+  - [png](https://github.com/image-rs/image-png) — PNG decoding and encoding.
+    - License: MIT OR Apache-2.0
+
+  - [flate2](https://github.com/rust-lang/flate2-rs) — DEFLATE and zlib-format compression and
+  decompression using its pure-Rust backend.
+    - License: MIT OR Apache-2.0
+
+  - [crc32fast](https://github.com/srijs/rust-crc32fast) — CRC-32 calculation.
+    - License: MIT OR Apache-2.0
+
+  - [zeroize](https://github.com/RustCrypto/utils/tree/master/zeroize) — secure clearing of
+  sensitive values from memory.
+    - License: MIT OR Apache-2.0
+
+  - [anyhow](https://github.com/dtolnay/anyhow) — application error handling.
+    - License: MIT OR Apache-2.0
+
+  - [libc](https://github.com/rust-lang/libc) — Linux/POSIX system-call and terminal interfaces.
+    - License: MIT OR Apache-2.0
+
+  - [Compact ICC Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles) — the Mastodon ICC
+  carrier template is derived from `sRGB-v2-nano.icc`.
+    - License: [CC0 1.0 Universal](https://github.com/saucecontrol/Compact-ICC-Profiles/blob/master/
+    license)
 
 ##
 

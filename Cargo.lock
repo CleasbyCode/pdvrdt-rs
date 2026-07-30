@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "pdvrdt"
-version = "4.8.0"
+version = "4.9.0"
 dependencies = [
  "alkali",
  "anyhow",

@@ -1,6 +1,6 @@
 [package]
 name = "pdvrdt"
-version = "5.0.0"
+version = "5.1.0"
 edition = "2021"
 description = "Linux-only PNG data-vehicle steganography tool (pdvrdt-rs)"
 license = "MIT"
@@ -15,6 +15,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "pdvrdt-rs"
 path = "src/main.rs"
+
+[[test]]
+name = "native_safety"
+path = "src/tests/native_safety.rs"
 
 [dependencies]
 alkali = "0.3"

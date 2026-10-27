@@ -1,0 +1,1077 @@
+use crate::common::bytes_equal_at;
+use crate::common::{require_span_range, span_has_range};
+use crate::compression::{zlib_deflate_file, zlib_inflate_prefix, zlib_payload_stream_bound};
+use crate::crypto::argon2id13 as pwhash;
+use crate::crypto::randombytes_into;
+use crate::crypto::secretstream;
+use crate::file_utils::OpenInputFile;
+use crate::pin_codec::{PinKind, PinPrompt, RecoveryPin};
+use crate::pin_input::get_pin;
+use anyhow::{anyhow, bail, Result};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use zeroize::{Zeroize, Zeroizing};
+
+pub struct ProfileOffsets {
+    pub kdf_metadata: usize,
+    pub encrypted_file: usize,
+    /// PDVRDT_SIG, the second half of the payload fingerprint.
+    pub pdv_signature: usize,
+}
+
+pub const MASTODON_OFFSETS: ProfileOffsets = ProfileOffsets {
+    kdf_metadata: 0x1BE,
+    encrypted_file: 0x1FE,
+    pdv_signature: 502,
+};
+
+pub const DEFAULT_OFFSETS: ProfileOffsets = ProfileOffsets {
+    kdf_metadata: 0x02D,
+    encrypted_file: 0x06E,
+    pdv_signature: 101,
+};
+
+pub const KDF_METADATA_REGION_BYTES: usize = 56;
+pub const KDF_MAGIC_OFFSET: usize = 0;
+pub const KDF_ALG_OFFSET: usize = 4;
+pub const KDF_SENTINEL_OFFSET: usize = 5;
+pub const KDF_SALT_OFFSET: usize = 8;
+pub const KDF_NONCE_OFFSET: usize = 24;
+
+pub const KDF_ALG_ARGON2ID13: u8 = 1;
+pub const KDF_SENTINEL: u8 = 0xA5;
+
+const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Wire format: each secretstream frame is preceded by its big-endian length in
+/// this many bytes. Part of the on-disk layout, so it is public alongside the
+/// offset tables rather than private to this module.
+pub const STREAM_FRAME_LEN_BYTES: usize = 4;
+
+/// Smallest ciphertext a well-formed payload can have: the stream header plus one
+/// framed TAG_FINAL frame. Used by conceal/recover to reject truncated payloads.
+/// Const-evaluated, so an overflow here is a compile-time error.
+pub const fn minimum_stream_cipher_size() -> usize {
+    secretstream::HEADERBYTES + STREAM_FRAME_LEN_BYTES + secretstream::ABYTES
+}
+/// KDF2: the key is Argon2id of the PIN's decimal digits (before pdvrdt 6.0).
+/// KDF3: the key is Argon2id of the 16 raw bytes of the 128-bit recovery KEY.
+/// Conceal writes only KDF3; both are recovered.
+const KDF_METADATA_MAGIC_V2: &[u8; 4] = b"KDF2";
+const KDF_METADATA_MAGIC_V3: &[u8; 4] = b"KDF3";
+pub const PDVRDT_SIG: &[u8; 7] = &[0xC6, 0x50, 0x3C, 0xEA, 0x5E, 0x9D, 0xF9];
+pub const MAX_MASTODON_PROFILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The two fixed byte strings that introduce an embedded payload: a fake zlib
+/// header for the default IDAT layout, and "icc\0" + compression method 0 for
+/// the Mastodon iCCP layout.
+pub const PDVRDT_IDAT_PREFIX: &[u8; 3] = b"\x78\x5e\x5c";
+pub const PDVRDT_ICCP_PREFIX: &[u8; 5] = b"icc\0\0";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KdfMetadataVersion {
+    None,
+    PinV2,
+    KeyV3,
+}
+
+impl KdfMetadataVersion {
+    /// The word recovery asks for: the image says which kind of secret it takes.
+    pub fn prompt(self) -> PinPrompt {
+        match self {
+            KdfMetadataVersion::KeyV3 => PinPrompt::Key,
+            KdfMetadataVersion::PinV2 => PinPrompt::Pin,
+            KdfMetadataVersion::None => PinPrompt::KeyOrPin,
+        }
+    }
+}
+
+fn read_frame_len(data: &[u8], index: usize) -> u32 {
+    u32::from_be_bytes(
+        data[index..index + STREAM_FRAME_LEN_BYTES]
+            .try_into()
+            .unwrap(),
+    )
+}
+
+/// KDF3 (a 128-bit KEY) hashes the 16 raw KEY bytes; KDF2 (an old PIN) hashes
+/// its decimal digits. The caller has already matched the secret to the image.
+fn derive_key_from_pin(
+    pin: &RecoveryPin,
+    salt_bytes: &[u8; pwhash::SALTBYTES],
+) -> Result<secretstream::Key> {
+    let pin_buf = Zeroizing::new(if pin.is_key() {
+        pin.key.to_vec()
+    } else {
+        pin.legacy_value.to_string().into_bytes()
+    });
+    let salt = pwhash::Salt::from_slice(salt_bytes)
+        .ok_or_else(|| anyhow!("KDF Error: Invalid salt length."))?;
+
+    // Wire-format parameters: they are not recorded in the KDF metadata (only
+    // the algorithm byte is), so every image ever made depends on these exact
+    // values. Pinned here rather than taken from the INTERACTIVE presets, which
+    // libsodium (and so alkali) is free to change between releases. 2 / 64 MiB
+    // is what those presets have always been for Argon2id13, so existing images
+    // are unaffected.
+    const PAYLOAD_KDF_OPSLIMIT: usize = 2;
+    const PAYLOAD_KDF_MEMLIMIT: usize = 64 * 1024 * 1024;
+
+    let mut key_bytes = Zeroizing::new([0u8; secretstream::KEYBYTES]);
+    pwhash::derive_key(
+        &mut *key_bytes,
+        &pin_buf,
+        &salt,
+        PAYLOAD_KDF_OPSLIMIT,
+        PAYLOAD_KDF_MEMLIMIT,
+    )
+    .map_err(|_| anyhow!("KDF Error: Unable to derive encryption key."))?;
+
+    let key = secretstream::Key::from_slice(&key_bytes[..])
+        .ok_or_else(|| anyhow!("KDF Error: Invalid derived key length."))?;
+    Ok(key)
+}
+
+fn append_encrypted_frames(
+    encrypted: &mut Vec<u8>,
+    plaintext: &[u8],
+    stream: &mut secretstream::Stream<secretstream::Push>,
+    cipher_chunk: &mut Vec<u8>,
+    max_encrypted_size: usize,
+    emit_final: bool,
+) -> Result<()> {
+    if plaintext.is_empty() && !emit_final {
+        return Ok(());
+    }
+
+    let mut offset = 0usize;
+    let mut emit_empty_final = plaintext.is_empty() && emit_final;
+
+    while emit_empty_final || offset < plaintext.len() {
+        let remaining = plaintext.len().saturating_sub(offset);
+        let chunk_len = remaining.min(STREAM_CHUNK_SIZE);
+        let is_final = emit_empty_final || offset + chunk_len == plaintext.len();
+        let tag = if emit_final && is_final {
+            secretstream::Tag::Final
+        } else {
+            secretstream::Tag::Message
+        };
+
+        stream
+            .push_to_vec(
+                &plaintext[offset..offset + chunk_len],
+                None,
+                tag,
+                cipher_chunk,
+            )
+            .map_err(|_| anyhow!("crypto_secretstream push failed."))?;
+
+        if cipher_chunk.len() > u32::MAX as usize {
+            bail!("crypto_secretstream frame too large.");
+        }
+
+        let final_size = encrypted
+            .len()
+            .checked_add(STREAM_FRAME_LEN_BYTES)
+            .and_then(|size| size.checked_add(cipher_chunk.len()))
+            .ok_or_else(|| anyhow!("File Size Error: Encrypted output overflow."))?;
+        if final_size > max_encrypted_size {
+            bail!(
+                "File Size Error: Compressed and encrypted payload exceeds the selected output size limit."
+            );
+        }
+
+        encrypted
+            .try_reserve(final_size - encrypted.len())
+            .map_err(|_| anyhow!("File Size Error: Unable to allocate encrypted output buffer."))?;
+
+        encrypted.extend_from_slice(&(cipher_chunk.len() as u32).to_be_bytes());
+        encrypted.extend_from_slice(cipher_chunk);
+
+        offset += chunk_len;
+        emit_empty_final = false;
+    }
+
+    Ok(())
+}
+
+fn decrypt_with_secretstream(
+    framed_ciphertext: &[u8],
+    key: &secretstream::Key,
+    header_bytes: &[u8; secretstream::HEADERBYTES],
+) -> Result<Option<Vec<u8>>> {
+    if !span_has_range(framed_ciphertext, 0, secretstream::HEADERBYTES) {
+        return Ok(None);
+    }
+    if framed_ciphertext[..secretstream::HEADERBYTES] != header_bytes[..] {
+        return Ok(None);
+    }
+
+    let Some(header) = secretstream::Header::from_slice(header_bytes) else {
+        return Ok(None);
+    };
+    let Ok(mut stream) = secretstream::Stream::init_pull(&header, key) else {
+        return Ok(None);
+    };
+    let reserve_size = framed_ciphertext
+        .len()
+        .saturating_sub(secretstream::HEADERBYTES);
+    let mut decrypted = Zeroizing::new(Vec::new());
+    decrypted
+        .try_reserve_exact(reserve_size)
+        .map_err(|_| anyhow!("File Decryption Error: Unable to allocate plaintext buffer."))?;
+    let mut offset = secretstream::HEADERBYTES;
+    let mut has_final_tag = false;
+
+    while offset < framed_ciphertext.len() {
+        if framed_ciphertext.len() - offset < STREAM_FRAME_LEN_BYTES {
+            return Ok(None);
+        }
+
+        let frame_len = read_frame_len(framed_ciphertext, offset) as usize;
+        offset += STREAM_FRAME_LEN_BYTES;
+
+        if frame_len < secretstream::ABYTES
+            || frame_len > framed_ciphertext.len().saturating_sub(offset)
+            || frame_len - secretstream::ABYTES > STREAM_CHUNK_SIZE
+        {
+            return Ok(None);
+        }
+
+        let frame = &framed_ciphertext[offset..offset + frame_len];
+        let Ok((mut plain_chunk, tag)) = stream.pull(frame, None) else {
+            return Ok(None);
+        };
+        decrypted.extend_from_slice(&plain_chunk);
+        plain_chunk.zeroize();
+
+        offset += frame_len;
+        if tag == secretstream::Tag::Final {
+            has_final_tag = true;
+            break;
+        }
+    }
+
+    if !has_final_tag || offset != framed_ciphertext.len() {
+        return Ok(None);
+    }
+
+    Ok(Some(std::mem::take(&mut *decrypted)))
+}
+
+/// Fills `out_pin` in place with a fresh 128-bit KEY (never all zero) rather
+/// than returning the secret by value: a moved return leaves an unwiped copy of
+/// it in the source slot that nothing owns.
+fn generate_recovery_key(out_pin: &mut RecoveryPin) {
+    out_pin.clear();
+    out_pin.kind = PinKind::Key128;
+    while out_pin.key.iter().all(|&b| b == 0) {
+        randombytes_into(&mut out_pin.key);
+    }
+}
+
+/// Extract the length-prefixed filename (raw OS bytes; not required to be UTF-8).
+fn extract_filename_prefix(payload: &mut Vec<u8>) -> Result<OsString> {
+    const CORRUPT_FILE_ERROR: &str = "File Recovery Error: Embedded profile is corrupt.";
+    if payload.is_empty() {
+        bail!("{}", CORRUPT_FILE_ERROR);
+    }
+
+    let filename_len = payload[0] as usize;
+    if filename_len == 0 {
+        bail!("{}", CORRUPT_FILE_ERROR);
+    }
+    let prefix_len = 1 + filename_len;
+    require_span_range(payload, 0, prefix_len, CORRUPT_FILE_ERROR)?;
+
+    let filename = OsString::from_vec(payload[1..prefix_len].to_vec());
+
+    let old_len = payload.len();
+    if old_len > prefix_len {
+        payload.copy_within(prefix_len.., 0);
+    }
+    let new_len = old_len - prefix_len;
+    payload[new_len..].zeroize();
+    payload.truncate(new_len);
+    Ok(filename)
+}
+
+fn get_kdf_metadata_version(data: &[u8], base_index: usize) -> KdfMetadataVersion {
+    if !span_has_range(data, base_index, KDF_METADATA_REGION_BYTES) {
+        return KdfMetadataVersion::None;
+    }
+
+    let has_common_fields = data[base_index + KDF_ALG_OFFSET] == KDF_ALG_ARGON2ID13
+        && data[base_index + KDF_SENTINEL_OFFSET] == KDF_SENTINEL;
+    if !has_common_fields {
+        return KdfMetadataVersion::None;
+    }
+
+    let magic = &data[base_index + KDF_MAGIC_OFFSET..base_index + KDF_MAGIC_OFFSET + 4];
+    if magic == KDF_METADATA_MAGIC_V3 {
+        KdfMetadataVersion::KeyV3
+    } else if magic == KDF_METADATA_MAGIC_V2 {
+        KdfMetadataVersion::PinV2
+    } else {
+        KdfMetadataVersion::None
+    }
+}
+
+pub fn kdf_metadata_version_at(data: &[u8], base_index: usize) -> KdfMetadataVersion {
+    get_kdf_metadata_version(data, base_index)
+}
+
+pub fn has_supported_kdf_metadata_at(data: &[u8], base_index: usize) -> bool {
+    get_kdf_metadata_version(data, base_index) != KdfMetadataVersion::None
+}
+
+/// True if `profile` carries pdvrdt's KDF metadata and signature at the offsets
+/// for this layout -- the payload fingerprint.
+///
+/// Deliberately liberal: conceal uses it to strip a stale payload out of a reused
+/// cover, so it must still match one too truncated for recovery to accept. The
+/// recover side adds its own length requirement on top.
+pub fn has_pdvrdt_profile_markers(profile: &[u8], offsets: &ProfileOffsets) -> bool {
+    has_supported_kdf_metadata_at(profile, offsets.kdf_metadata)
+        && bytes_equal_at(profile, offsets.pdv_signature, PDVRDT_SIG)
+}
+
+/// The zlib-compressed profile inside an iCCP chunk if that chunk is a pdvrdt
+/// Mastodon payload, or `None` if it is an ordinary ICC profile.
+///
+/// Inflates only the fixed metadata/signature prefix, so a genuine profile or a
+/// decompression bomb is rejected without expanding it. Single source of truth:
+/// conceal must strip such a payload when its image is reused as a cover and
+/// recover must extract it, and the two can never be allowed to disagree about
+/// which chunks count.
+pub fn find_pdvrdt_iccp_payload(iccp_data: &[u8]) -> Option<&[u8]> {
+    const PROFILE_PREFIX_SIZE: usize = MASTODON_OFFSETS.pdv_signature + PDVRDT_SIG.len();
+
+    if !iccp_data.starts_with(PDVRDT_ICCP_PREFIX) {
+        return None;
+    }
+    let compressed = &iccp_data[PDVRDT_ICCP_PREFIX.len()..];
+    if compressed.is_empty() {
+        return None;
+    }
+
+    let profile_prefix = zlib_inflate_prefix(compressed, PROFILE_PREFIX_SIZE).ok()?;
+    if profile_prefix.len() != PROFILE_PREFIX_SIZE
+        || !has_pdvrdt_profile_markers(&profile_prefix, &MASTODON_OFFSETS)
+    {
+        return None;
+    }
+    Some(compressed)
+}
+
+enum PayloadSource<'a> {
+    File {
+        data_file: &'a OpenInputFile,
+        is_compressed_file: bool,
+    },
+    Prepared(&'a [u8]),
+}
+
+impl PayloadSource<'_> {
+    /// Size of the zlib payload this source will hand over: exact for stored
+    /// or prepared input, an upper bound for deflated input.
+    fn estimated_payload_size(&self) -> Result<usize> {
+        match self {
+            PayloadSource::File {
+                data_file,
+                is_compressed_file,
+            } => zlib_payload_stream_bound(data_file.size(), *is_compressed_file),
+            PayloadSource::Prepared(data) => Ok(data.len()),
+        }
+    }
+
+    fn estimate_is_exact(&self) -> bool {
+        match self {
+            PayloadSource::File {
+                is_compressed_file, ..
+            } => *is_compressed_file,
+            PayloadSource::Prepared(_) => true,
+        }
+    }
+}
+
+/// How a profile's buffer is sized while frames are appended to it.
+///
+/// When the payload size is known -- stored input, or prepared data -- the
+/// final size is reserved up front, capped at the output limit. Growing frame
+/// by frame instead would, near the 2 GiB default limit, briefly hold both the
+/// old and the doubled buffer on a reallocation.
+///
+/// For deflated input the estimate is only an upper bound, and a compressible
+/// payload can come in far below it: reserving the bound would ask a 1 GiB
+/// file of zeros for ~1 GiB of address space to hold a profile of a few MiB.
+/// So that case starts at a bounded size. If the profile outgrows it, the bound
+/// is tried next: it is only address space until written, and an
+/// incompressible payload then costs a single copy of the initial reservation,
+/// where doubling would end with the old buffer and a near-final one both
+/// resident -- about twice the profile. Where that speculative reservation is
+/// refused (an address-space limit, say), growth falls back to doubling, never
+/// past the bound while the profile still fits under it.
+struct ProfileReservation {
+    max_size: usize,
+    ceiling: usize,
+    speculation_refused: bool,
+}
+
+impl ProfileReservation {
+    const INITIAL_DEFLATED_RESERVE: usize = 64 * 1024 * 1024;
+
+    fn new(
+        profile_vec: &mut Vec<u8>,
+        estimated_size: usize,
+        estimate_is_exact: bool,
+        max_profile_size: usize,
+    ) -> Result<Self> {
+        let ceiling = estimated_size.min(max_profile_size);
+        let initial = if estimate_is_exact {
+            ceiling
+        } else {
+            ceiling.min(Self::INITIAL_DEFLATED_RESERVE)
+        };
+        Self::reserve(profile_vec, initial)?;
+        Ok(Self {
+            max_size: max_profile_size,
+            ceiling,
+            speculation_refused: false,
+        })
+    }
+
+    /// Make room for `extra` more bytes. A size past the output limit is left
+    /// to `append_encrypted_frames`, which reports it.
+    fn ensure_room_for(&mut self, profile_vec: &mut Vec<u8>, extra: usize) -> Result<()> {
+        let Some(needed) = profile_vec.len().checked_add(extra) else {
+            return Ok(());
+        };
+        let capacity = profile_vec.capacity();
+        if needed > self.max_size || needed <= capacity {
+            return Ok(());
+        }
+        if needed <= self.ceiling && !self.speculation_refused {
+            if Self::reserve(profile_vec, self.ceiling).is_ok() {
+                return Ok(());
+            }
+            self.speculation_refused = true;
+        }
+        let doubled = if capacity > self.max_size / 2 {
+            self.max_size
+        } else {
+            capacity * 2
+        };
+        let mut target = doubled.max(needed);
+        if needed <= self.ceiling {
+            target = target.min(self.ceiling);
+        }
+        Self::reserve(profile_vec, target)
+    }
+
+    fn reserve(profile_vec: &mut Vec<u8>, target: usize) -> Result<()> {
+        if target > profile_vec.capacity() {
+            profile_vec
+                .try_reserve_exact(target - profile_vec.len())
+                .map_err(|_| {
+                    anyhow!("File Size Error: Unable to allocate encrypted output buffer.")
+                })?;
+        }
+        Ok(())
+    }
+}
+
+const FRAME_OVERHEAD: usize = STREAM_FRAME_LEN_BYTES + secretstream::ABYTES;
+
+/// Bytes `append_encrypted_frames` adds for `plaintext_size` bytes of non-final
+/// plaintext: the data plus a length field and auth tag per frame.
+fn framed_size(plaintext_size: usize) -> Result<usize> {
+    if plaintext_size == 0 {
+        return Ok(0);
+    }
+    let frame_count = 1 + (plaintext_size - 1) / STREAM_CHUNK_SIZE;
+    let overhead = frame_count
+        .checked_mul(FRAME_OVERHEAD)
+        .ok_or_else(|| anyhow!("File Size Error: Encrypted output overflow."))?;
+    plaintext_size
+        .checked_add(overhead)
+        .ok_or_else(|| anyhow!("File Size Error: Encrypted output overflow."))
+}
+
+/// Exact size of the profile `encrypt_payload_to_profile` builds from a template
+/// of `template_size` bytes, a `payload_size`-byte payload handed over in one
+/// piece (or in pieces that are whole multiples of the frame size), and a
+/// filename of `filename_length` bytes: stream header, filename frame, payload
+/// frames and the empty final frame.
+fn encrypted_profile_size(
+    template_size: usize,
+    payload_size: usize,
+    filename_length: usize,
+) -> Result<usize> {
+    let filename_frame_size = framed_size(1 + filename_length)?;
+    let payload_frame_size = framed_size(payload_size)?;
+
+    template_size
+        .checked_add(secretstream::HEADERBYTES)
+        .and_then(|size| size.checked_add(filename_frame_size))
+        .and_then(|size| size.checked_add(payload_frame_size))
+        .and_then(|size| size.checked_add(FRAME_OVERHEAD))
+        .ok_or_else(|| anyhow!("File Size Error: Encrypted output overflow."))
+}
+
+fn encrypt_payload_to_profile(
+    out_pin: &mut RecoveryPin,
+    profile_vec: &mut Vec<u8>,
+    data_filename: &[u8],
+    has_mastodon_option: bool,
+    max_profile_size: usize,
+    payload_source: PayloadSource<'_>,
+) -> Result<()> {
+    let offsets = if has_mastodon_option {
+        &MASTODON_OFFSETS
+    } else {
+        &DEFAULT_OFFSETS
+    };
+    const CORRUPT_PROFILE_ERROR: &str = "Internal Error: Corrupt profile template.";
+
+    require_span_range(
+        profile_vec,
+        offsets.kdf_metadata,
+        KDF_METADATA_REGION_BYTES,
+        CORRUPT_PROFILE_ERROR,
+    )?;
+    if offsets.encrypted_file != profile_vec.len() {
+        bail!("{}", CORRUPT_PROFILE_ERROR);
+    }
+    if profile_vec.len() > max_profile_size {
+        bail!("File Size Error: Cover image leaves no room for an embedded payload.");
+    }
+
+    if data_filename.is_empty() || data_filename.len() > u8::MAX as usize {
+        bail!("Data File Error: Invalid data filename length.");
+    }
+
+    let estimated_size = encrypted_profile_size(
+        profile_vec.len(),
+        payload_source.estimated_payload_size()?,
+        data_filename.len(),
+    )?;
+    let mut reservation = ProfileReservation::new(
+        profile_vec,
+        estimated_size,
+        payload_source.estimate_is_exact(),
+        max_profile_size,
+    )?;
+
+    let mut filename_prefix = Zeroizing::new(vec![0u8; 1 + data_filename.len()]);
+    filename_prefix[0] = data_filename.len() as u8;
+    filename_prefix[1..].copy_from_slice(data_filename);
+
+    // Generated straight into the caller's storage: there is never a second copy
+    // to scrub, and the caller's RecoveryPin wipes it on every path out of here.
+    generate_recovery_key(out_pin);
+    let mut salt = Zeroizing::new([0u8; pwhash::SALTBYTES]);
+    randombytes_into(&mut *salt);
+
+    let key = derive_key_from_pin(out_pin, &salt)?;
+    let (mut stream, stream_header) = secretstream::Stream::init_push(&key)
+        .map_err(|_| anyhow!("crypto_secretstream init_push failed."))?;
+
+    if stream_header.0.len() > max_profile_size - profile_vec.len() {
+        bail!(
+            "File Size Error: Compressed and encrypted payload exceeds the selected output size limit."
+        );
+    }
+    profile_vec
+        .try_reserve(stream_header.0.len())
+        .map_err(|_| anyhow!("File Size Error: Unable to allocate encrypted output buffer."))?;
+    profile_vec.extend_from_slice(&stream_header.0);
+
+    let mut cipher_chunk =
+        Zeroizing::new(Vec::with_capacity(STREAM_CHUNK_SIZE + secretstream::ABYTES));
+    append_encrypted_frames(
+        profile_vec,
+        &filename_prefix,
+        &mut stream,
+        &mut cipher_chunk,
+        max_profile_size,
+        false,
+    )?;
+
+    let mut saw_compressed_output = false;
+    {
+        let mut consume_payload = |chunk: &[u8]| {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+
+            saw_compressed_output = true;
+            reservation.ensure_room_for(profile_vec, framed_size(chunk.len())?)?;
+            append_encrypted_frames(
+                profile_vec,
+                chunk,
+                &mut stream,
+                &mut cipher_chunk,
+                max_profile_size,
+                false,
+            )
+        };
+
+        match payload_source {
+            PayloadSource::File {
+                data_file,
+                is_compressed_file,
+            } => zlib_deflate_file(data_file, is_compressed_file, &mut consume_payload)?,
+            PayloadSource::Prepared(prepared_data) => consume_payload(prepared_data)?,
+        }
+    }
+
+    if !saw_compressed_output {
+        bail!("File Size Error: File is zero bytes. Probable compression failure.");
+    }
+
+    // Close the secretstream with an empty final frame.
+    reservation.ensure_room_for(profile_vec, FRAME_OVERHEAD)?;
+    append_encrypted_frames(
+        profile_vec,
+        &[],
+        &mut stream,
+        &mut cipher_chunk,
+        max_profile_size,
+        true,
+    )?;
+
+    let mut random_region = Zeroizing::new([0u8; KDF_METADATA_REGION_BYTES]);
+    randombytes_into(&mut *random_region);
+    profile_vec[offsets.kdf_metadata..offsets.kdf_metadata + KDF_METADATA_REGION_BYTES]
+        .copy_from_slice(&*random_region);
+
+    profile_vec
+        [offsets.kdf_metadata + KDF_MAGIC_OFFSET..offsets.kdf_metadata + KDF_MAGIC_OFFSET + 4]
+        .copy_from_slice(KDF_METADATA_MAGIC_V3);
+    profile_vec[offsets.kdf_metadata + KDF_ALG_OFFSET] = KDF_ALG_ARGON2ID13;
+    profile_vec[offsets.kdf_metadata + KDF_SENTINEL_OFFSET] = KDF_SENTINEL;
+
+    require_span_range(
+        profile_vec,
+        offsets.kdf_metadata + KDF_SALT_OFFSET,
+        pwhash::SALTBYTES,
+        CORRUPT_PROFILE_ERROR,
+    )?;
+    require_span_range(
+        profile_vec,
+        offsets.kdf_metadata + KDF_NONCE_OFFSET,
+        secretstream::HEADERBYTES,
+        CORRUPT_PROFILE_ERROR,
+    )?;
+
+    profile_vec[offsets.kdf_metadata + KDF_SALT_OFFSET
+        ..offsets.kdf_metadata + KDF_SALT_OFFSET + pwhash::SALTBYTES]
+        .copy_from_slice(&*salt);
+    profile_vec[offsets.kdf_metadata + KDF_NONCE_OFFSET
+        ..offsets.kdf_metadata + KDF_NONCE_OFFSET + secretstream::HEADERBYTES]
+        .copy_from_slice(&stream_header.0);
+
+    Ok(())
+}
+
+/// Writes the freshly generated 128-bit recovery KEY into `out_pin` rather than
+/// returning it: see generate_recovery_key() for why no secret leaves this
+/// module by value.
+pub fn encrypt_compressed_file_to_profile(
+    out_pin: &mut RecoveryPin,
+    profile_vec: &mut Vec<u8>,
+    data_file: &OpenInputFile,
+    data_filename: &[u8],
+    is_compressed_file: bool,
+    has_mastodon_option: bool,
+    max_profile_size: usize,
+) -> Result<()> {
+    encrypt_payload_to_profile(
+        out_pin,
+        profile_vec,
+        data_filename,
+        has_mastodon_option,
+        max_profile_size,
+        PayloadSource::File {
+            data_file,
+            is_compressed_file,
+        },
+    )
+}
+
+/// Reddit has already compressed and capacity-checked its payload. Encrypt the
+/// prepared zlib bytes into the ordinary pdvrdt profile without compressing them
+/// a second time.
+pub fn encrypt_prepared_data_to_profile(
+    out_pin: &mut RecoveryPin,
+    profile_vec: &mut Vec<u8>,
+    prepared_data: &[u8],
+    data_filename: &[u8],
+    has_mastodon_option: bool,
+    max_profile_size: usize,
+) -> Result<()> {
+    encrypt_payload_to_profile(
+        out_pin,
+        profile_vec,
+        data_filename,
+        has_mastodon_option,
+        max_profile_size,
+        PayloadSource::Prepared(prepared_data),
+    )
+}
+
+/// Exact size produced by `encrypt_prepared_data_to_profile` for Reddit's
+/// default profile layout, including its fixed prefix, stream header, filename
+/// frame, payload frames, and final frame.
+pub fn compute_reddit_encrypted_profile_size(
+    prepared_data_size: usize,
+    filename_length: usize,
+) -> Result<usize> {
+    if filename_length == 0 || filename_length > u8::MAX as usize {
+        bail!("Data File Error: Invalid data filename length.");
+    }
+    encrypted_profile_size(
+        DEFAULT_OFFSETS.encrypted_file,
+        prepared_data_size,
+        filename_length,
+    )
+}
+
+/// The first eight digest bytes, read big-endian, are the carrier key.
+fn carrier_key_from_digest(digest: &[u8], out_key: &mut Zeroizing<u64>) {
+    **out_key = digest[..8]
+        .iter()
+        .fold(0u64, |key, &byte| (key << 8) | u64::from(byte));
+}
+
+/// Length of the carrier version-3/4 ChaCha20 key.
+pub const CARRIER_CHACHA_KEY_BYTES: usize = 32;
+
+/// Keys for the Reddit carrier's sample permutation and whitening. Which keys
+/// depend on the kind of secret; each comes from a single Argon2id13 run (two
+/// passes, 64 MiB, 32-byte output), here called D:
+///
+/// * A 128-bit KEY (carrier version 4, which conceal writes):
+///   D = Argon2id(the 16 KEY bytes, salt `pdvrdtcarrier-v4`);
+///   `chacha` = keyed BLAKE2b-256 of `pdvrdt carrier v4` under D.
+/// * An old numeric PIN (recovery only):
+///   D = Argon2id(the PIN as 8 big-endian bytes, salt `pdvrdtcarrier-v2`);
+///   `chacha` = keyed BLAKE2b-256 of `pdvrdt carrier v3` under D (version 3);
+///   `v2` = the first eight bytes of D, read big-endian (splitmix64, 5.1).
+///
+/// One derivation serves both old versions, so recovering a version-2 image
+/// after the version-3 attempt misses costs no second Argon2 pass. All fields
+/// zeroize on drop. These parameters are part of the carrier wire format and
+/// must not change without a new carrier version.
+#[derive(Default)]
+pub struct CarrierKeys {
+    pub chacha: Zeroizing<[u8; CARRIER_CHACHA_KEY_BYTES]>,
+    /// Carrier header version `chacha` keys: 4 or 3.
+    pub chacha_version: u8,
+    pub has_v2: bool,
+    pub v2: Zeroizing<u64>,
+}
+
+const CARRIER_KDF_OPSLIMIT: usize = 2;
+const CARRIER_KDF_MEMLIMIT: usize = 64 * 1024 * 1024;
+
+/// Argon2id with the carrier parameters into `digest`, then keyed BLAKE2b-256
+/// of `domain` under the whole Argon2 output.
+fn derive_chacha_carrier_key(
+    password: &[u8],
+    salt: &pwhash::Salt,
+    domain: &[u8],
+    digest: &mut [u8; 32],
+    out_key: &mut [u8; CARRIER_CHACHA_KEY_BYTES],
+) -> Result<()> {
+    pwhash::derive_key(
+        &mut digest[..],
+        password,
+        salt,
+        CARRIER_KDF_OPSLIMIT,
+        CARRIER_KDF_MEMLIMIT,
+    )
+    .map_err(|_| anyhow!("KDF Error: Unable to derive Reddit carrier key."))?;
+    alkali::hash::generic::hash_custom(domain, Some(&digest[..]), &mut out_key[..])
+        .map_err(|_| anyhow!("KDF Error: Unable to derive Reddit carrier key."))?;
+    Ok(())
+}
+
+/// Fill `out_keys` (never returned by value, like the KEY). The encrypted
+/// payload's random salt cannot be read before locating the carrier, so this
+/// uses a separate, fixed domain salt: it permits work to be shared across
+/// images, but each candidate still requires Argon2, and a 128-bit KEY cannot
+/// be searched at all.
+pub fn derive_carrier_keys_from_pin(pin: &RecoveryPin, out_keys: &mut CarrierKeys) -> Result<()> {
+    const KEY_DOMAIN_SALT: pwhash::Salt = pwhash::Salt(*b"pdvrdtcarrier-v4");
+    // The "-v2" salt is kept for version 3 so one derivation yields both keys.
+    const PIN_DOMAIN_SALT: pwhash::Salt = pwhash::Salt(*b"pdvrdtcarrier-v2");
+
+    let mut digest = Zeroizing::new([0u8; 32]);
+    match pin.kind {
+        PinKind::Key128 => {
+            derive_chacha_carrier_key(
+                &pin.key,
+                &KEY_DOMAIN_SALT,
+                b"pdvrdt carrier v4",
+                &mut digest,
+                &mut out_keys.chacha,
+            )?;
+            out_keys.chacha_version = 4;
+            out_keys.has_v2 = false;
+            *out_keys.v2 = 0;
+        }
+        PinKind::LegacyPin => {
+            let pin_bytes = Zeroizing::new(pin.legacy_value.to_be_bytes());
+            derive_chacha_carrier_key(
+                &pin_bytes[..],
+                &PIN_DOMAIN_SALT,
+                b"pdvrdt carrier v3",
+                &mut digest,
+                &mut out_keys.chacha,
+            )?;
+            out_keys.chacha_version = 3;
+            // The whole digest keyed the hash above, so the version-3 key is
+            // unrelated to the 64-bit version-2 key taken from its first bytes.
+            carrier_key_from_digest(&digest[..], &mut out_keys.v2);
+            out_keys.has_v2 = true;
+        }
+        PinKind::None => bail!("KDF Error: Missing recovery KEY."),
+    }
+    Ok(())
+}
+
+/// Recovery only: version 1 used this inexpensive hash and remains vulnerable
+/// to cheap PIN checks. Never use this derivation when creating a new carrier.
+///
+/// A full-length digest, with the first 8 bytes taken as the key. Not an 8-byte
+/// digest: BLAKE2b binds the output length into its parameter block, so hashing
+/// to 8 bytes and truncating a 32-byte hash give different values. libsodium
+/// accepts an out-of-range 8 without complaint while alkali rejects it, so
+/// fixing the length is what keeps this port deriving the same key as the C++.
+pub(crate) fn derive_legacy_carrier_key_from_pin(
+    pin: &RecoveryPin,
+    out_key: &mut Zeroizing<u64>,
+) -> Result<()> {
+    // Domain separation, so this can never collide with any other use of the PIN.
+    const DOMAIN: [u8; 32] = *b"pdvrdt carrier v5\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
+    if pin.kind != PinKind::LegacyPin {
+        bail!("KDF Error: Version-1 carriers take a numeric PIN.");
+    }
+    let pin_bytes = Zeroizing::new(pin.legacy_value.to_be_bytes());
+    let mut digest = Zeroizing::new([0u8; 32]);
+    alkali::hash::generic::hash_custom(&pin_bytes[..], Some(&DOMAIN), &mut digest[..])
+        .map_err(|_| anyhow!("KDF Error: Unable to derive carrier key."))?;
+
+    carrier_key_from_digest(&digest[..], out_key);
+    Ok(())
+}
+
+/// Decrypt embedded payload. Returns `Ok(None)` only for a wrong KEY/PIN, a
+/// secret of the wrong kind for the image, or corrupt crypto (after a
+/// well-formed entry). Entry format errors surface as `Err`.
+pub fn decrypt_data_file_with_pin(
+    png_vec: &mut Vec<u8>,
+    recovery_pin: &RecoveryPin,
+    is_mastodon_file: bool,
+) -> Result<Option<OsString>> {
+    let offsets = if is_mastodon_file {
+        &MASTODON_OFFSETS
+    } else {
+        &DEFAULT_OFFSETS
+    };
+
+    const CORRUPT_FILE_ERROR: &str = "File Recovery Error: Embedded profile is corrupt.";
+    require_span_range(
+        png_vec,
+        offsets.kdf_metadata,
+        KDF_METADATA_REGION_BYTES,
+        CORRUPT_FILE_ERROR,
+    )?;
+    if offsets.encrypted_file > png_vec.len() {
+        bail!("{}", CORRUPT_FILE_ERROR);
+    }
+
+    let kdf_version = get_kdf_metadata_version(png_vec, offsets.kdf_metadata);
+    if kdf_version == KdfMetadataVersion::None {
+        bail!(
+            "File Decryption Error: Unsupported legacy encrypted file format. Use an older pdvrdt release to recover this file."
+        );
+    }
+    // A KEY for an old PIN image, or a PIN for a KEY image, is simply the wrong
+    // secret. Say so without spending an Argon2id pass on it.
+    if recovery_pin.is_key() != (kdf_version == KdfMetadataVersion::KeyV3) {
+        return Ok(None);
+    }
+
+    let mut salt = Zeroizing::new([0u8; pwhash::SALTBYTES]);
+    let mut stream_header = Zeroizing::new([0u8; secretstream::HEADERBYTES]);
+
+    require_span_range(
+        png_vec,
+        offsets.kdf_metadata + KDF_SALT_OFFSET,
+        pwhash::SALTBYTES,
+        CORRUPT_FILE_ERROR,
+    )?;
+    require_span_range(
+        png_vec,
+        offsets.kdf_metadata + KDF_NONCE_OFFSET,
+        secretstream::HEADERBYTES,
+        CORRUPT_FILE_ERROR,
+    )?;
+
+    salt.copy_from_slice(
+        &png_vec[offsets.kdf_metadata + KDF_SALT_OFFSET
+            ..offsets.kdf_metadata + KDF_SALT_OFFSET + pwhash::SALTBYTES],
+    );
+    stream_header.copy_from_slice(
+        &png_vec[offsets.kdf_metadata + KDF_NONCE_OFFSET
+            ..offsets.kdf_metadata + KDF_NONCE_OFFSET + secretstream::HEADERBYTES],
+    );
+
+    let key = derive_key_from_pin(recovery_pin, &salt)?;
+
+    let ciphertext_length = png_vec.len() - offsets.encrypted_file;
+    if ciphertext_length < minimum_stream_cipher_size() {
+        bail!("{}", CORRUPT_FILE_ERROR);
+    }
+
+    let framed_ciphertext = &png_vec[offsets.encrypted_file..];
+    let Some(decrypted) = decrypt_with_secretstream(framed_ciphertext, &key, &stream_header)?
+    else {
+        return Ok(None);
+    };
+
+    *png_vec = decrypted;
+    Ok(Some(extract_filename_prefix(png_vec)?))
+}
+
+pub fn decrypt_data_file(
+    png_vec: &mut Vec<u8>,
+    is_mastodon_file: bool,
+) -> Result<Option<OsString>> {
+    let offsets = if is_mastodon_file {
+        &MASTODON_OFFSETS
+    } else {
+        &DEFAULT_OFFSETS
+    };
+    let prompt = get_kdf_metadata_version(png_vec, offsets.kdf_metadata).prompt();
+    let mut recovery_pin = RecoveryPin::default();
+    get_pin(prompt, &mut recovery_pin)?;
+    decrypt_data_file_with_pin(png_vec, &recovery_pin, is_mastodon_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn carrier_kdf_matches_fixed_current_and_legacy_vectors() {
+        // Frozen C++/libsodium answers, cross-checked with Python hashlib. The
+        // PIN is eight big-endian bytes, not decimal text; the digest is 32 bytes.
+        for (pin, v2, v3, legacy) in [
+            (
+                1u64,
+                0xcacf13e77f898a90u64,
+                "09e577435b6f2e751bd987af05bb2325d2441c18bd345da2d1f2d9135307f435",
+                0xceaeade28e02ec7du64,
+            ),
+            (
+                0x8000000000000000,
+                0x193b2f36ba42f1ed,
+                "283be8a31692b302232f8a83a450705c6fa3caf00819fddf1976ed2f34ea36cb",
+                0x54da2d2159d6b2be,
+            ),
+            (
+                0xffffffffffffffff,
+                0x151428112b0af782,
+                "8554a8f6e280ca3b9b93701607aa949a113589f2882f750d30090b0330dce948",
+                0x26ebb91e649c1b08,
+            ),
+        ] {
+            let mut recovery_pin = RecoveryPin::default();
+            recovery_pin.set_legacy(pin);
+            let mut keys = CarrierKeys::default();
+            derive_carrier_keys_from_pin(&recovery_pin, &mut keys).unwrap();
+            assert!(keys.chacha_version == 3 && keys.has_v2);
+            assert_eq!(*keys.v2, v2);
+            let v3_hex: String = keys.chacha.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(v3_hex, v3);
+            let mut key = Zeroizing::new(0u64);
+            derive_legacy_carrier_key_from_pin(&recovery_pin, &mut key).unwrap();
+            assert_eq!(*key, legacy);
+        }
+    }
+
+    #[test]
+    fn carrier_kdf_matches_fixed_v4_key_vectors() {
+        use crate::pin_codec::KEY_BYTES;
+        // Frozen independently in Python (Argon2id13/2/64 MiB, salt
+        // b"pdvrdtcarrier-v4", the 16 raw KEY bytes; then BLAKE2b-256 of
+        // b"pdvrdt carrier v4" keyed with the digest), as in the C++ tests.
+        for (key_hex, v4) in [
+            (
+                "000102030405060708090a0b0c0d0e0f",
+                "6eba642bddf8a83f77945ef0d588a818a6810090beb97729990957f6f97e91c8",
+            ),
+            (
+                "ffffffffffffffffffffffffffffffff",
+                "fd755da59b640cc22250b5c084822637830db45618bf590a4825e79dca02cb0e",
+            ),
+            (
+                "00000000000000000000000000000001",
+                "053414080cbdeba96a730a7f0649d8408635e01a6b69649659997fda747983bf",
+            ),
+        ] {
+            let mut key = [0u8; KEY_BYTES];
+            for (i, b) in key.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&key_hex[2 * i..2 * i + 2], 16).unwrap();
+            }
+            let mut recovery_pin = RecoveryPin::default();
+            recovery_pin.set_key(&key);
+            let mut keys = CarrierKeys::default();
+            derive_carrier_keys_from_pin(&recovery_pin, &mut keys).unwrap();
+            assert!(keys.chacha_version == 4 && !keys.has_v2);
+            let hex: String = keys.chacha.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, v4);
+            let mut legacy = Zeroizing::new(0u64);
+            assert!(derive_legacy_carrier_key_from_pin(&recovery_pin, &mut legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn frame_len_roundtrip() {
+        let out = 0x01020304u32.to_be_bytes().to_vec();
+        assert_eq!(out, [1, 2, 3, 4]);
+        assert_eq!(read_frame_len(&out, 0), 0x01020304);
+    }
+
+    #[test]
+    fn extract_filename_accepts_non_utf8_bytes() {
+        let mut payload = vec![3, 0xC3, 0x28, 0x41, b'Z']; // invalid UTF-8 sequence + data
+                                                           // 0xC3 0x28 is invalid UTF-8; OsString still accepts the raw bytes.
+        payload[0] = 3;
+        let name = extract_filename_prefix(&mut payload).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(name.as_bytes(), &[0xC3, 0x28, 0x41]);
+        assert_eq!(payload, b"Z");
+    }
+
+    #[test]
+    fn reddit_encrypted_profile_size_accounts_for_frames() {
+        assert_eq!(compute_reddit_encrypted_profile_size(1, 1).unwrap(), 200);
+        assert_eq!(compute_reddit_encrypted_profile_size(1, 20).unwrap(), 219);
+        assert_eq!(
+            compute_reddit_encrypted_profile_size(STREAM_CHUNK_SIZE, 20).unwrap(),
+            STREAM_CHUNK_SIZE + 218
+        );
+        assert_eq!(
+            compute_reddit_encrypted_profile_size(STREAM_CHUNK_SIZE + 1, 20).unwrap(),
+            STREAM_CHUNK_SIZE + 1 + 239
+        );
+        assert!(compute_reddit_encrypted_profile_size(1, 0).is_err());
+        assert!(compute_reddit_encrypted_profile_size(1, u8::MAX as usize + 1).is_err());
+    }
+}

@@ -164,11 +164,11 @@ Reddit capacity check for conceal -r mode only.
 Cover Image: 5400KiB, 1600x1600, Non-interlaced 8-bit RGB PNG, Adaptive (1,15,4) matrix embedding.
 
 Theoretical adaptive capacity limit for this cover image:              255980 bytes (~249KiB).
-Conservative maximum compressed capacity with a 20-character filename: 255762 bytes (~249KiB).
-Recommended  maximum compressed capacity with a 20-character filename: 254738 bytes (~248KiB).
+Conservative maximum stored payload capacity with a 20-byte filename:  255762 bytes (~249KiB).
+Recommended  maximum stored payload capacity with a 20-byte filename:  254738 bytes (~248KiB).
 ```
 
-The figure reported is the total encrypted ***envelope*** capacity, not a raw secret-file limit: for a payload contained in one encryption frame, the filename, encryption and recovery metadata consume 199 to 218 bytes, and larger payloads add framing overhead. Don't aim at the theoretical limit — where capacity allows, keep the compressed payload at least **1KiB** below the conservative maximum. The size check performed by ***conceal*** is the authoritative one.
+The figure reported is the total encrypted ***envelope*** capacity, not a raw secret-file limit: for a payload contained in one encryption frame, the filename, encryption and recovery metadata consume 199 to 218 bytes, and larger payloads add framing overhead. Don't aim at the theoretical limit — where capacity allows, keep the stored payload at least **1KiB** below the conservative maximum. The size check performed by ***conceal*** is the authoritative one.
 
 ## Conceal mode platform options
 

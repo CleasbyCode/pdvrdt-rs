@@ -1,6 +1,6 @@
 [package]
 name = "pdvrdt"
-version = "5.2.0"
+version = "6.0.0"
 edition = "2021"
 description = "Linux-only PNG data-vehicle steganography tool (pdvrdt-rs)"
 license = "MIT"

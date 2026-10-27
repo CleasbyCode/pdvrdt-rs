@@ -14,7 +14,7 @@ Using the ***default conceal mode***, you can conceal any file type, with the fi
 There is also a [***Web edition***](https://cleasbycode.co.uk/pdvrdt/app/), which you can use immediately, as a convenient alternative to downloading and compiling the CLI source code. Web file uploads are limited to **20MiB**.
 
 ![Demo Image](https://github.com/CleasbyCode/pdvrdt_rust/blob/main/demo_image/prdt_557475.png)  
-*Demo Image: **"Wolf"** / ***KEY: JYVV-3UAD-8gMK-CF3G-Uk5q-AByw***
+***Demo Image -*** ***KEY: JYVV-3UAD-8gMK-CF3G-Uk5q-AByw***
 
 ## How pdvrdt-rs conceals data
 

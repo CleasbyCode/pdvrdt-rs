@@ -1,7 +1,10 @@
 # pdvrdt-rs
 ***This is an experimental Rust port of my C++ steganography tool [***pdvrdt***](https://github.com/CleasbyCode/pdvrdt)***
 
-***pdvrdt-rs*** is a fast, easy-to-use steganography command-line tool for concealing and extracting any file type via a **PNG** image. ***Linux only***.
+***pdvrdt-rs*** is a steganography command-line tool for concealing and extracting any file type via a **PNG** image.
+
+![Demo Image](https://github.com/CleasbyCode/pdvrdt_rust/blob/main/demo_image/prdt_717994.png)  
+***Demo Image -*** ***KEY: 4KQr-Cusn-uM8d-8SjD-UJv6-565C***
 
 It is format-compatible with the C++ ***pdvrdt***: either build can recover the other's images.
 
@@ -12,9 +15,6 @@ Images created before ***pdvrdt-rs 6.0*** (or ***pdvrdt 6.0***) used a numeric *
 Using the ***default conceal mode***, you can conceal any file type, with the finished image capped at ***2GiB***. The other platform conceal modes and the compatible social media sites (*listed below*) have their own ***much smaller*** size limits and other requirements.
 
 There is also a [***Web edition***](https://cleasbycode.co.uk/pdvrdt/app/), which you can use immediately, as a convenient alternative to downloading and compiling the CLI source code. Web file uploads are limited to **20MiB**.
-
-![Demo Image](https://github.com/CleasbyCode/pdvrdt_rust/blob/main/demo_image/prdt_717994.png)  
-***Demo Image -*** ***KEY: 4KQr-Cusn-uM8d-8SjD-UJv6-565C***
 
 ## How pdvrdt-rs conceals data
 
